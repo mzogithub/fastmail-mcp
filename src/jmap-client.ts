@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { FastmailAuth } from './auth.js';
 
 export interface JmapSession {
@@ -16,6 +17,11 @@ export interface JmapRequest {
 export interface JmapResponse {
   methodResponses: Array<[string, any, string]>;
   sessionState: string;
+}
+
+export interface EmailSubmissionResult {
+  submissionId: string;
+  trackingId: string;
 }
 
 export class JmapClient {
@@ -243,6 +249,71 @@ export class JmapClient {
     return typeof value === 'string' ? value : undefined;
   }
 
+  private getTrackingPixelUrlBase(): string | null {
+    const trackingPixelUrl = process.env.TRACKING_PIXEL_URL?.trim();
+    if (!trackingPixelUrl) {
+      return null;
+    }
+    return trackingPixelUrl.replace(/\/+$/, '');
+  }
+
+  private injectTrackingPixel(htmlBody: string, trackingId: string): string {
+    const trackingPixelUrlBase = this.getTrackingPixelUrlBase();
+    if (!trackingPixelUrlBase) {
+      return htmlBody;
+    }
+
+    const pixelTag = `<img src="${trackingPixelUrlBase}/pixel/${trackingId}.gif" width="1" height="1" style="display:none" />`;
+    if (/<\/body>/i.test(htmlBody)) {
+      return htmlBody.replace(/<\/body>/i, `${pixelTag}</body>`);
+    }
+
+    return `${htmlBody}${pixelTag}`;
+  }
+
+  private async updateDraftHtmlForTracking(draftEmailId: string, draftEmail: any, trackingId: string): Promise<void> {
+    const existingHtmlBody = this.getBodyValue(draftEmail, draftEmail.htmlBody);
+    if (existingHtmlBody === undefined) {
+      return;
+    }
+
+    const trackedHtmlBody = this.injectTrackingPixel(existingHtmlBody, trackingId);
+    if (trackedHtmlBody === existingHtmlBody) {
+      return;
+    }
+
+    const existingTextBody = this.getBodyValue(draftEmail, draftEmail.textBody);
+    const bodyValues: Record<string, { value: string }> = {
+      html: { value: trackedHtmlBody }
+    };
+    if (existingTextBody !== undefined) {
+      bodyValues.text = { value: existingTextBody };
+    }
+
+    const session = await this.getSession();
+    const request: JmapRequest = {
+      using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
+      methodCalls: [
+        ['Email/set', {
+          accountId: session.accountId,
+          update: {
+            [draftEmailId]: {
+              textBody: existingTextBody !== undefined ? [{ partId: 'text', type: 'text/plain' }] : [],
+              htmlBody: [{ partId: 'html', type: 'text/html' }],
+              bodyValues
+            }
+          }
+        }, 'updateDraftForTracking']
+      ]
+    };
+
+    const response = await this.makeRequest(request);
+    const result = response.methodResponses[0][1];
+    if (result.notUpdated && result.notUpdated[draftEmailId]) {
+      throw new Error('Failed to add tracking pixel to draft before sending.');
+    }
+  }
+
   async sendEmail(email: {
     to: string[];
     cc?: string[];
@@ -252,7 +323,7 @@ export class JmapClient {
     htmlBody?: string;
     from?: string;
     mailboxId?: string;
-  }): Promise<string> {
+  }): Promise<EmailSubmissionResult> {
     const session = await this.getSession();
     const selectedIdentity = await this.resolveIdentity(email.from);
     const fromEmail = selectedIdentity.email;
@@ -276,7 +347,12 @@ export class JmapClient {
       ...(email.bcc || [])
     ];
 
-    const emailObject = this.buildEmailObject(email, fromEmail, initialMailboxId);
+    const trackingId = randomUUID();
+    const trackedEmail = {
+      ...email,
+      htmlBody: email.htmlBody !== undefined ? this.injectTrackingPixel(email.htmlBody, trackingId) : email.htmlBody
+    };
+    const emailObject = this.buildEmailObject(trackedEmail, fromEmail, initialMailboxId);
 
     const request: JmapRequest = {
       using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail', 'urn:ietf:params:jmap:submission'],
@@ -321,7 +397,10 @@ export class JmapClient {
       throw new Error('Failed to submit email. Please try again later.');
     }
     
-    return submissionResult.created?.submission?.id || 'unknown';
+    return {
+      submissionId: submissionResult.created?.submission?.id || 'unknown',
+      trackingId
+    };
   }
 
   async saveDraft(email: {
@@ -364,10 +443,13 @@ export class JmapClient {
     return result.created?.draft?.id || 'unknown';
   }
 
-  async sendDraft(draftEmailId: string): Promise<string> {
+  async sendDraft(draftEmailId: string): Promise<EmailSubmissionResult> {
     const session = await this.getSession();
     const draftEmail = await this.getEmailById(draftEmailId);
     const sentMailbox = await this.getMailboxByRole('sent', 'sent');
+    const trackingId = randomUUID();
+
+    await this.updateDraftHtmlForTracking(draftEmailId, draftEmail, trackingId);
 
     const toRecipients = (draftEmail.to || []).map((addr: any) => addr.email).filter(Boolean);
     const ccRecipients = (draftEmail.cc || []).map((addr: any) => addr.email).filter(Boolean);
@@ -414,7 +496,10 @@ export class JmapClient {
       throw new Error('Failed to submit draft. Please try again later.');
     }
 
-    return result.created?.submission?.id || 'unknown';
+    return {
+      submissionId: result.created?.submission?.id || 'unknown',
+      trackingId
+    };
   }
 
   async listDrafts(limit: number = 20): Promise<any[]> {

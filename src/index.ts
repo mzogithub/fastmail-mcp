@@ -871,7 +871,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        const submissionId = await client.sendEmail({
+        const result = await client.sendEmail({
           to,
           cc,
           bcc,
@@ -886,7 +886,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: 'text',
-              text: `Email sent successfully. Submission ID: ${submissionId}`,
+              text: `Email sent successfully. Submission ID: ${result.submissionId}. Tracking ID: ${result.trackingId}`,
             },
           ],
         };
@@ -931,13 +931,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw new McpError(ErrorCode.InvalidParams, 'draftEmailId is required');
         }
 
-        const submissionId = await client.sendDraft(draftEmailId);
+        const result = await client.sendDraft(draftEmailId);
 
         return {
           content: [
             {
               type: 'text',
-              text: `Draft sent successfully. Submission ID: ${submissionId}`,
+              text: `Draft sent successfully. Submission ID: ${result.submissionId}. Tracking ID: ${result.trackingId}`,
             },
           ],
         };
