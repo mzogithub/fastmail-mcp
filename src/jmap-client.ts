@@ -81,7 +81,7 @@ export class JmapClient {
 
   async getMailboxes(): Promise<any[]> {
     const session = await this.getSession();
-    
+
     const request: JmapRequest = {
       using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
       methodCalls: [
@@ -234,6 +234,12 @@ export class JmapClient {
 
     const sentMailboxIds: Record<string, boolean> = {};
     sentMailboxIds[sentMailbox.id] = true;
+    
+    const envelopeRecipients = [
+      ...email.to,
+      ...(email.cc || []),
+      ...(email.bcc || [])
+    ];
 
     const emailObject = {
       mailboxIds: initialMailboxIds,
@@ -266,7 +272,7 @@ export class JmapClient {
               identityId: selectedIdentity.id,
               envelope: {
                 mailFrom: { email: fromEmail },
-                rcptTo: email.to.map(addr => ({ email: addr }))
+                rcptTo: envelopeRecipients.map(addr => ({ email: addr }))
               }
             }
           },
@@ -335,8 +341,6 @@ export class JmapClient {
   async markEmailRead(emailId: string, read: boolean = true): Promise<void> {
     const session = await this.getSession();
     
-    const keywords = read ? { $seen: true } : {};
-    
     const request: JmapRequest = {
       using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
       methodCalls: [
@@ -344,7 +348,7 @@ export class JmapClient {
           accountId: session.accountId,
           update: {
             [emailId]: {
-              keywords
+              'keywords/$seen': read ? true : null
             }
           }
         }, 'updateEmail']
@@ -669,12 +673,11 @@ export class JmapClient {
 
   async bulkMarkRead(emailIds: string[], read: boolean = true): Promise<void> {
     const session = await this.getSession();
-    
-    const keywords = read ? { $seen: true } : {};
+
     const updates: Record<string, any> = {};
     
     emailIds.forEach(id => {
-      updates[id] = { keywords };
+      updates[id] = { 'keywords/$seen': read ? true : null };
     });
 
     const request: JmapRequest = {
