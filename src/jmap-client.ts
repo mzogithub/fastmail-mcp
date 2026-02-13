@@ -134,7 +134,22 @@ export class JmapClient {
         ['Email/get', {
           accountId: session.accountId,
           ids: [id],
-          properties: ['id', 'subject', 'from', 'to', 'cc', 'bcc', 'receivedAt', 'textBody', 'htmlBody', 'attachments', 'bodyValues'],
+          properties: [
+            'id',
+            'subject',
+            'from',
+            'to',
+            'cc',
+            'bcc',
+            'replyTo',
+            'receivedAt',
+            'textBody',
+            'htmlBody',
+            'attachments',
+            'bodyValues',
+            'messageId',
+            'header:References:asText'
+          ],
           bodyProperties: ['partId', 'blobId', 'type', 'size'],
           fetchTextBodyValues: true,
           fetchHTMLBodyValues: true,
@@ -247,6 +262,83 @@ export class JmapClient {
     }
     const value = email.bodyValues?.[partId]?.value;
     return typeof value === 'string' ? value : undefined;
+  }
+
+  private normalizeSubjectPrefix(subject: string, prefix: string): string {
+    const escapedPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const prefixedSubjectRegex = new RegExp(`^\\s*${escapedPrefix}\\s*:`, 'i');
+    if (prefixedSubjectRegex.test(subject)) {
+      return subject;
+    }
+    return `${prefix}: ${subject}`;
+  }
+
+  private dedupeEmailAddresses(addresses: string[]): string[] {
+    const seen = new Set<string>();
+    const deduped: string[] = [];
+
+    for (const address of addresses) {
+      const normalized = address.trim().toLowerCase();
+      if (!normalized || seen.has(normalized)) {
+        continue;
+      }
+      seen.add(normalized);
+      deduped.push(address.trim());
+    }
+
+    return deduped;
+  }
+
+  private escapeHtml(value: string): string {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  private stripHtml(value: string): string {
+    return value.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  private formatAddress(address: any): string {
+    if (!address || !address.email) {
+      return 'unknown sender';
+    }
+    return address.name ? `${address.name} <${address.email}>` : address.email;
+  }
+
+  private normalizeMessageId(messageId: string): string {
+    const trimmed = messageId.trim();
+    if (!trimmed) {
+      return '';
+    }
+    if (trimmed.startsWith('<') && trimmed.endsWith('>')) {
+      return trimmed;
+    }
+    return `<${trimmed}>`;
+  }
+
+  private async createDraftEmail(emailObject: any): Promise<string> {
+    const session = await this.getSession();
+    const request: JmapRequest = {
+      using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
+      methodCalls: [
+        ['Email/set', {
+          accountId: session.accountId,
+          create: { draft: emailObject }
+        }, 'createDraft']
+      ]
+    };
+
+    const response = await this.makeRequest(request);
+    const result = response.methodResponses[0][1];
+    if (result.notCreated && result.notCreated.draft) {
+      throw new Error('Failed to save draft. Please check inputs and try again.');
+    }
+
+    return result.created?.draft?.id || 'unknown';
   }
 
   private getTrackingPixelUrlBase(): string | null {
@@ -413,7 +505,6 @@ export class JmapClient {
     from?: string;
     mailboxId?: string;
   }): Promise<string> {
-    const session = await this.getSession();
     const selectedIdentity = await this.resolveIdentity(email.from);
     const draftsMailbox = await this.getMailboxByRole('drafts', 'draft');
 
@@ -423,24 +514,7 @@ export class JmapClient {
 
     const initialMailboxId = email.mailboxId || draftsMailbox.id;
     const emailObject = this.buildEmailObject(email, selectedIdentity.email, initialMailboxId);
-
-    const request: JmapRequest = {
-      using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
-      methodCalls: [
-        ['Email/set', {
-          accountId: session.accountId,
-          create: { draft: emailObject }
-        }, 'createDraft']
-      ]
-    };
-
-    const response = await this.makeRequest(request);
-    const result = response.methodResponses[0][1];
-    if (result.notCreated && result.notCreated.draft) {
-      throw new Error('Failed to save draft. Please check inputs and try again.');
-    }
-
-    return result.created?.draft?.id || 'unknown';
+    return this.createDraftEmail(emailObject);
   }
 
   async sendDraft(draftEmailId: string): Promise<EmailSubmissionResult> {
@@ -628,6 +702,206 @@ export class JmapClient {
     if (result.notDestroyed && result.notDestroyed[draftEmailId]) {
       throw new Error('Failed to delete draft.');
     }
+  }
+
+  async replyToEmail(params: {
+    emailId: string;
+    textBody?: string;
+    htmlBody?: string;
+    replyAll?: boolean;
+  }): Promise<string> {
+    const { emailId, textBody, htmlBody, replyAll = false } = params;
+    if (!textBody && !htmlBody) {
+      throw new Error('Reply body is required as textBody and/or htmlBody.');
+    }
+
+    const originalEmail = await this.getEmailById(emailId);
+    const selectedIdentity = await this.resolveIdentity();
+    const draftsMailbox = await this.getMailboxByRole('drafts', 'draft');
+
+    const identityEmails = new Set(
+      (await this.getIdentities()).map((identity: any) => identity.email.toLowerCase())
+    );
+
+    const replyTargetAddresses = (
+      originalEmail.replyTo?.length ? originalEmail.replyTo : originalEmail.from
+    ) || [];
+
+    const baseToRecipients = replyTargetAddresses
+      .map((address: any) => address.email)
+      .filter((address: string | undefined): address is string => Boolean(address));
+
+    let toRecipients = this.dedupeEmailAddresses(baseToRecipients);
+    let ccRecipients: string[] = [];
+
+    if (replyAll) {
+      const originalTo = (originalEmail.to || [])
+        .map((address: any) => address.email)
+        .filter((address: string | undefined): address is string => Boolean(address));
+      const originalCc = (originalEmail.cc || [])
+        .map((address: any) => address.email)
+        .filter((address: string | undefined): address is string => Boolean(address));
+
+      const filteredTo = originalTo.filter((address: string) => !identityEmails.has(address.toLowerCase()));
+      toRecipients = this.dedupeEmailAddresses([...toRecipients, ...filteredTo]);
+
+      ccRecipients = this.dedupeEmailAddresses(
+        originalCc.filter((address: string) =>
+          !identityEmails.has(address.toLowerCase()) &&
+          !toRecipients.some(toAddress => toAddress.toLowerCase() === address.toLowerCase())
+        )
+      );
+    }
+
+    if (toRecipients.length === 0 && originalEmail.from?.[0]?.email) {
+      toRecipients = [originalEmail.from[0].email];
+    }
+    if (toRecipients.length === 0) {
+      throw new Error('Could not determine recipient for reply.');
+    }
+
+    const originalSubject = originalEmail.subject || '(no subject)';
+    const replySubject = this.normalizeSubjectPrefix(originalSubject, 'Re');
+    const originalSender = this.formatAddress(originalEmail.from?.[0]);
+    const originalDate = originalEmail.receivedAt ? new Date(originalEmail.receivedAt).toUTCString() : 'an unknown date';
+
+    const originalTextBody =
+      this.getBodyValue(originalEmail, originalEmail.textBody) ||
+      this.stripHtml(this.getBodyValue(originalEmail, originalEmail.htmlBody) || '');
+    const originalHtmlBody = this.getBodyValue(originalEmail, originalEmail.htmlBody);
+
+    const quotedTextBody = originalTextBody
+      ? originalTextBody.split(/\r?\n/).map((line: string) => `> ${line}`).join('\n')
+      : '> (no original message content)';
+    const composedTextBody = [
+      textBody?.trim() || '',
+      '',
+      `On ${originalDate}, ${originalSender} wrote:`,
+      quotedTextBody
+    ].join('\n').trim();
+
+    let composedHtmlBody: string | undefined;
+    const htmlIntro = htmlBody !== undefined
+      ? htmlBody
+      : (textBody ? `<p>${this.escapeHtml(textBody).replace(/\n/g, '<br />')}</p>` : undefined);
+
+    if (htmlIntro !== undefined || originalHtmlBody !== undefined) {
+      const quotedHtml = originalHtmlBody !== undefined
+        ? originalHtmlBody
+        : `<pre>${this.escapeHtml(originalTextBody || '(no original message content)')}</pre>`;
+      composedHtmlBody = `${htmlIntro || ''}<p>${this.escapeHtml(`On ${originalDate}, ${originalSender} wrote:`)}</p><blockquote>${quotedHtml}</blockquote>`;
+    }
+
+    const messageIds = Array.isArray(originalEmail.messageId)
+      ? originalEmail.messageId
+      : (typeof originalEmail.messageId === 'string' ? [originalEmail.messageId] : []);
+    const normalizedMessageId = typeof messageIds[0] === 'string'
+      ? this.normalizeMessageId(messageIds[0])
+      : '';
+    const existingReferences = typeof originalEmail['header:References:asText'] === 'string'
+      ? originalEmail['header:References:asText'].trim()
+      : '';
+
+    const headers: Array<{ name: string; value: string }> = [];
+    if (normalizedMessageId) {
+      headers.push({ name: 'In-Reply-To', value: normalizedMessageId });
+    }
+
+    const referencesValue = [existingReferences, normalizedMessageId].filter(Boolean).join(' ').trim();
+    if (referencesValue) {
+      headers.push({ name: 'References', value: referencesValue });
+    }
+
+    const replyDraftObject = this.buildEmailObject({
+      to: toRecipients,
+      cc: ccRecipients,
+      subject: replySubject,
+      textBody: composedTextBody || undefined,
+      htmlBody: composedHtmlBody
+    }, selectedIdentity.email, draftsMailbox.id);
+
+    if (headers.length > 0) {
+      replyDraftObject.headers = headers;
+    }
+
+    return this.createDraftEmail(replyDraftObject);
+  }
+
+  async forwardEmail(params: {
+    emailId: string;
+    to: string[];
+    body?: string;
+  }): Promise<string> {
+    const { emailId, to, body } = params;
+    const dedupedTo = this.dedupeEmailAddresses(to);
+    if (dedupedTo.length === 0) {
+      throw new Error('Forward requires at least one recipient.');
+    }
+
+    const originalEmail = await this.getEmailById(emailId);
+    const selectedIdentity = await this.resolveIdentity();
+    const draftsMailbox = await this.getMailboxByRole('drafts', 'draft');
+
+    const originalSubject = originalEmail.subject || '(no subject)';
+    const forwardSubject = this.normalizeSubjectPrefix(originalSubject, 'Fwd');
+    const originalSender = this.formatAddress(originalEmail.from?.[0]);
+    const originalRecipients = (originalEmail.to || []).map((address: any) => this.formatAddress(address)).join(', ') || '(unknown)';
+    const originalDate = originalEmail.receivedAt ? new Date(originalEmail.receivedAt).toUTCString() : 'an unknown date';
+
+    const originalTextBody =
+      this.getBodyValue(originalEmail, originalEmail.textBody) ||
+      this.stripHtml(this.getBodyValue(originalEmail, originalEmail.htmlBody) || '');
+    const originalHtmlBody = this.getBodyValue(originalEmail, originalEmail.htmlBody);
+
+    const forwardedHeaderText = [
+      '---------- Forwarded message ----------',
+      `From: ${originalSender}`,
+      `Date: ${originalDate}`,
+      `Subject: ${originalSubject}`,
+      `To: ${originalRecipients}`
+    ].join('\n');
+
+    const composedTextBody = [
+      body?.trim() || '',
+      body ? '' : '',
+      forwardedHeaderText,
+      '',
+      originalTextBody || '(no original message content)'
+    ].join('\n').trim();
+
+    let composedHtmlBody: string | undefined;
+    if (originalHtmlBody !== undefined || body !== undefined) {
+      const introHtml = body ? `<p>${this.escapeHtml(body).replace(/\n/g, '<br />')}</p>` : '';
+      const forwardedHeaderHtml = `<pre>${this.escapeHtml(forwardedHeaderText)}</pre>`;
+      const forwardedContentHtml = originalHtmlBody !== undefined
+        ? `<blockquote>${originalHtmlBody}</blockquote>`
+        : `<pre>${this.escapeHtml(originalTextBody || '(no original message content)')}</pre>`;
+      composedHtmlBody = `${introHtml}${forwardedHeaderHtml}${forwardedContentHtml}`;
+    }
+
+    const forwardedAttachments = (originalEmail.attachments || [])
+      .map((attachment: any) => ({
+        blobId: attachment.blobId,
+        type: attachment.type,
+        name: attachment.name,
+        size: attachment.size,
+        cid: attachment.cid,
+        disposition: attachment.disposition
+      }))
+      .filter((attachment: any) => attachment.blobId && attachment.type);
+
+    const forwardDraftObject = this.buildEmailObject({
+      to: dedupedTo,
+      subject: forwardSubject,
+      textBody: composedTextBody || undefined,
+      htmlBody: composedHtmlBody
+    }, selectedIdentity.email, draftsMailbox.id);
+
+    if (forwardedAttachments.length > 0) {
+      forwardDraftObject.attachments = forwardedAttachments;
+    }
+
+    return this.createDraftEmail(forwardDraftObject);
   }
 
   async getRecentEmails(limit: number = 10, mailboxName: string = 'inbox'): Promise<any[]> {

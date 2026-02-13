@@ -358,6 +358,62 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: 'reply_to_email',
+        description: 'Compose a reply draft with proper threading headers',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            emailId: {
+              type: 'string',
+              description: 'ID of the email to reply to',
+            },
+            body: {
+              type: 'object',
+              description: 'Reply body content',
+              properties: {
+                text: {
+                  type: 'string',
+                  description: 'Plain text reply content (optional if html is provided)',
+                },
+                html: {
+                  type: 'string',
+                  description: 'HTML reply content (optional if text is provided)',
+                },
+              },
+            },
+            replyAll: {
+              type: 'boolean',
+              description: 'When true, includes original To/Cc recipients (excluding your own identities)',
+              default: false,
+            },
+          },
+          required: ['emailId', 'body'],
+        },
+      },
+      {
+        name: 'forward_email',
+        description: 'Compose a forward draft with original attachments',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            emailId: {
+              type: 'string',
+              description: 'ID of the email to forward',
+            },
+            to: {
+              type: 'array',
+              items: { type: 'string' },
+              description: 'Recipient email addresses for the forward',
+            },
+            body: {
+              type: 'string',
+              description: 'Optional additional text to include before forwarded content',
+            },
+          },
+          required: ['emailId', 'to'],
+        },
+      },
+      {
         name: 'search_emails',
         description: 'Search emails by subject or content',
         inputSchema: {
@@ -1011,6 +1067,57 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case 'reply_to_email': {
+        const { emailId, body, replyAll = false } = args as any;
+        if (!emailId) {
+          throw new McpError(ErrorCode.InvalidParams, 'emailId is required');
+        }
+        if (!body || (body.text === undefined && body.html === undefined)) {
+          throw new McpError(ErrorCode.InvalidParams, 'body.text or body.html is required');
+        }
+
+        const draftId = await client.replyToEmail({
+          emailId,
+          textBody: body.text,
+          htmlBody: body.html,
+          replyAll,
+        });
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Reply draft created successfully. Draft Email ID: ${draftId}`,
+            },
+          ],
+        };
+      }
+
+      case 'forward_email': {
+        const { emailId, to, body } = args as any;
+        if (!emailId) {
+          throw new McpError(ErrorCode.InvalidParams, 'emailId is required');
+        }
+        if (!to || !Array.isArray(to) || to.length === 0) {
+          throw new McpError(ErrorCode.InvalidParams, 'to field is required and must be a non-empty array');
+        }
+
+        const draftId = await client.forwardEmail({
+          emailId,
+          to,
+          body,
+        });
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Forward draft created successfully. Draft Email ID: ${draftId}`,
+            },
+          ],
+        };
+      }
+
       case 'search_emails': {
         const { query, limit = 20 } = args as any;
         if (!query) {
@@ -1416,6 +1523,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             functions: [
               'list_mailboxes', 'list_emails', 'get_email', 'send_email',
               'save_draft', 'send_draft', 'list_drafts', 'update_draft', 'delete_draft',
+              'reply_to_email', 'forward_email',
               'search_emails', 'get_recent_emails', 'mark_email_read', 'delete_email', 'move_email',
               'get_email_attachments', 'download_attachment', 'advanced_search', 'get_thread',
               'get_mailbox_stats', 'get_account_summary', 'bulk_mark_read', 'bulk_move', 'bulk_delete'
