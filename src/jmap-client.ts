@@ -457,6 +457,34 @@ export class JmapClient {
     }
     return trackingPixelUrl.replace(/\/+$/, '');
   }
+  private async registerWithTracker(params: {
+    trackingId: string;
+    subject: string;
+    recipients: string;
+    fromAddress: string;
+  }): Promise<void> {
+    const trackerBase = this.getTrackingPixelUrlBase();
+    const trackerApiKey = process.env.TRACKER_API_KEY?.trim();
+    if (!trackerBase || !trackerApiKey) {
+      return;
+    }
+    try {
+      const resp = await fetch(`${trackerBase}/api/emails`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${trackerApiKey}`
+        },
+        body: JSON.stringify(params)
+      });
+      if (!resp.ok) {
+        console.error(`Tracker registration failed: ${resp.status} ${resp.statusText}`);
+      }
+    } catch (err) {
+      console.error('Tracker registration error:', err);
+    }
+  }
+
 
   private injectTrackingPixel(htmlBody: string, trackingId: string): string {
     const trackingPixelUrlBase = this.getTrackingPixelUrlBase();
@@ -598,6 +626,14 @@ export class JmapClient {
       throw new Error('Failed to submit email. Please try again later.');
     }
     
+    // Register with tracker for dashboard metadata
+    await this.registerWithTracker({
+      trackingId,
+      subject: email.subject,
+      recipients: email.to.join(', '),
+      fromAddress: fromEmail
+    });
+
     return {
       submissionId: submissionResult.created?.submission?.id || 'unknown',
       trackingId
@@ -678,6 +714,14 @@ export class JmapClient {
     if (result.notCreated && result.notCreated.submission) {
       throw new Error('Failed to submit draft. Please try again later.');
     }
+
+    // Register with tracker for dashboard metadata
+    await this.registerWithTracker({
+      trackingId,
+      subject: draftEmail.subject || '(no subject)',
+      recipients: [...toRecipients, ...ccRecipients].join(', '),
+      fromAddress: fromAddress || selectedIdentity.email
+    });
 
     return {
       submissionId: result.created?.submission?.id || 'unknown',
