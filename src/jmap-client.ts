@@ -460,7 +460,7 @@ export class JmapClient {
   private async registerWithTracker(params: {
     trackingId: string;
     subject: string;
-    recipients: string;
+    recipients: string[];
     fromAddress: string;
   }): Promise<void> {
     const trackerBase = this.getTrackingPixelUrlBase();
@@ -630,7 +630,7 @@ export class JmapClient {
     await this.registerWithTracker({
       trackingId,
       subject: email.subject,
-      recipients: email.to.join(', '),
+      recipients: [...email.to, ...(email.cc || []), ...(email.bcc || [])],
       fromAddress: fromEmail
     });
 
@@ -719,7 +719,7 @@ export class JmapClient {
     await this.registerWithTracker({
       trackingId,
       subject: draftEmail.subject || '(no subject)',
-      recipients: [...toRecipients, ...ccRecipients].join(', '),
+      recipients: [...toRecipients, ...ccRecipients, ...bccRecipients],
       fromAddress: fromAddress || selectedIdentity.email
     });
 
